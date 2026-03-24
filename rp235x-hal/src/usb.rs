@@ -43,6 +43,9 @@ struct Endpoint {
     ep_type: EndpointType,
     max_packet_size: u16,
     buffer_offset: u16,
+    double_buffered: bool,
+    /// Which buffer to fill next (0 or 1). Hardware alternates strictly.
+    next_buf: u8,
 }
 impl Endpoint {
     unsafe fn get_buf_parts(&self) -> (*mut u8, usize) {
@@ -55,6 +58,16 @@ impl Endpoint {
                 self.max_packet_size as usize,
             )
         }
+    }
+
+    /// Buffer 1 base address (buffer 0 base + max_packet_size aligned to 64).
+    unsafe fn get_buf1_parts(&self) -> (*mut u8, usize) {
+        const DPRAM_BASE: *mut u8 = pac::USB_DPRAM::ptr() as *mut u8;
+        let aligned = self.max_packet_size.div_ceil(64) * 64;
+        (
+            DPRAM_BASE.offset(0x180 + (self.buffer_offset * 64) as isize + aligned as isize),
+            self.max_packet_size as usize,
+        )
     }
 
     fn get_buf(&self) -> &[u8] {
@@ -71,6 +84,15 @@ impl Endpoint {
         // offset is checked by Inner::ep_allocate.
         unsafe {
             let (base, len) = self.get_buf_parts();
+            core::slice::from_raw_parts_mut(base, len)
+        }
+    }
+
+    fn get_buf1_mut(&mut self) -> &mut [u8] {
+        // SAFETY:
+        // offset is checked by Inner::ep_allocate (2x allocation for double-buffered).
+        unsafe {
+            let (base, len) = self.get_buf1_parts();
             core::slice::from_raw_parts_mut(base, len)
         }
     }
@@ -156,23 +178,36 @@ impl Inner {
                 ep_type,
                 max_packet_size,
                 buffer_offset: 0, // not used on CTRL ep
+                double_buffered: false,
+                next_buf: 0,
             });
         } else {
             // size in 64bytes units.
             // NOTE: the compiler is smart enough to recognize /64 as a 6bit right shift so let's
             // keep the division here for the sake of clarity
             let aligned_sized = max_packet_size.div_ceil(64);
-            if (self.next_offset + aligned_sized) > (4096 / 64) {
+
+            // Double-buffer bulk IN endpoints: allocate 2x buffer space
+            let is_double = ep_type == EndpointType::Bulk && ep_dir == UsbDirection::In;
+            let alloc_units = if is_double {
+                aligned_sized * 2
+            } else {
+                aligned_sized
+            };
+
+            if (self.next_offset + alloc_units) > (4096 / 64) {
                 return Err(UsbError::EndpointMemoryOverflow);
             }
 
             let buffer_offset = self.next_offset;
-            self.next_offset += aligned_sized;
+            self.next_offset += alloc_units;
 
             *maybe_ep = Some(Endpoint {
                 ep_type,
                 max_packet_size,
                 buffer_offset,
+                double_buffered: is_double,
+                next_buf: 0,
             });
         }
         Ok(ep_addr)
@@ -214,13 +249,27 @@ impl Inner {
                 w.endpoint_type().variant(ep_type);
                 w.interrupt_per_buff().set_bit();
                 w.enable().set_bit();
+                if ep.double_buffered {
+                    w.double_buffered().set_bit();
+                }
                 w.buffer_address().bits(0x180 + (ep.buffer_offset << 6))
             });
             // reset OUT ep and prepare IN ep to accept data
             let buf_control = &self.ctrl_dpram.ep_buffer_control(index + 2);
             if (index & 1) == 0 {
-                // first write occur on DATA0 so prepare the pid bit to be flipped
-                buf_control.write(|w| w.pid_0().set_bit());
+                // IN endpoint
+                if ep.double_buffered {
+                    // Fixed PIDs: buffer 0 = DATA0, buffer 1 = DATA1
+                    // Reset buffer selector to buffer 0
+                    buf_control.write(|w| {
+                        w.pid_0().clear_bit();
+                        w.pid_1().set_bit();
+                        w.reset().set_bit()
+                    });
+                } else {
+                    // first write occur on DATA0 so prepare the pid bit to be flipped
+                    buf_control.write(|w| w.pid_0().set_bit());
+                }
             } else {
                 buf_control.write(|w| unsafe {
                     w.pid_0().clear_bit();
@@ -228,6 +277,13 @@ impl Inner {
                 });
                 crate::arch::delay(12);
                 buf_control.modify(|_, w| w.available_0().set_bit());
+            }
+        }
+
+        // Reset double-buffer tracking for IN endpoints
+        for ep in self.in_endpoints.iter_mut().flatten() {
+            if ep.double_buffered {
+                ep.next_buf = 0;
             }
         }
     }
@@ -241,25 +297,81 @@ impl Inner {
             .ok_or(UsbError::InvalidEndpoint)?;
 
         let buf_control = &self.ctrl_dpram.ep_buffer_control(index * 2);
-        if buf_control.read().available_0().bit_is_set() {
-            return Err(UsbError::WouldBlock);
+
+        if ep.double_buffered {
+            // Hardware alternates strictly between buffer 0 and 1.
+            // We must fill them in the same order.
+            //
+            // RACE AVOIDANCE: Use 16-bit writes to update only our half of the
+            // 32-bit EP_BUFFER_CONTROL register. `modify` does a 32-bit read-
+            // modify-write which races with the USB controller on the OTHER
+            // buffer's AVAILABLE bit, potentially re-arming it with stale data.
+            // Since DPRAM is real RAM, 16-bit writes update only the addressed
+            // halfword, leaving the other half untouched.
+            if ep.next_buf == 0 {
+                if buf_control.read().available_0().bit_is_set() {
+                    return Err(UsbError::WouldBlock);
+                }
+                let ep_buf = ep.get_buf_mut();
+                if ep_buf.len() < buf.len() {
+                    return Err(UsbError::BufferOverflow);
+                }
+                ep_buf[..buf.len()].copy_from_slice(buf);
+
+                // Buffer 0 = lower 16 bits: LENGTH_0[9:0], AVAILABLE_0[10],
+                // STALL[11], RESET[12], PID_0[13], LAST_0[14], FULL_0[15]
+                let bc_half = buf_control.as_ptr() as *mut u16;
+                let meta: u16 = (buf.len() as u16 & 0x3FF) | (1 << 15); // LENGTH + FULL_0, PID_0=0
+                unsafe { core::ptr::write_volatile(bc_half, meta); }
+                crate::arch::delay(12);
+                unsafe { core::ptr::write_volatile(bc_half, meta | (1 << 10)); } // + AVAILABLE_0
+
+                ep.next_buf = 1;
+                Ok(buf.len())
+            } else {
+                if buf_control.read().available_1().bit_is_set() {
+                    return Err(UsbError::WouldBlock);
+                }
+                let ep_buf1 = ep.get_buf1_mut();
+                if ep_buf1.len() < buf.len() {
+                    return Err(UsbError::BufferOverflow);
+                }
+                ep_buf1[..buf.len()].copy_from_slice(buf);
+
+                // Buffer 1 = upper 16 bits: LENGTH_1[9:0], AVAILABLE_1[10],
+                // [11], [12], PID_1[13], LAST_1[14], FULL_1[15]
+                // (bit positions relative to the halfword)
+                let bc_half = unsafe { (buf_control.as_ptr() as *mut u16).add(1) };
+                let meta: u16 = (buf.len() as u16 & 0x3FF) | (1 << 15) | (1 << 13); // LENGTH + FULL_1 + PID_1
+                unsafe { core::ptr::write_volatile(bc_half, meta); }
+                crate::arch::delay(12);
+                unsafe { core::ptr::write_volatile(bc_half, meta | (1 << 10)); } // + AVAILABLE_1
+
+                ep.next_buf = 0;
+                Ok(buf.len())
+            }
+        } else {
+            // Single-buffered path (original)
+            if buf_control.read().available_0().bit_is_set() {
+                return Err(UsbError::WouldBlock);
+            }
+
+            let ep_buf = ep.get_buf_mut();
+            if ep_buf.len() < buf.len() {
+                return Err(UsbError::BufferOverflow);
+            }
+            ep_buf[..buf.len()].copy_from_slice(buf);
+
+            buf_control.modify(|r, w| unsafe {
+                w.length_0().bits(buf.len() as u16);
+                w.full_0().set_bit();
+                w.pid_0().bit(!r.pid_0().bit())
+            });
+            crate::arch::delay(12);
+            buf_control.modify(|_, w| w.available_0().set_bit());
+
+            Ok(buf.len())
         }
-
-        let ep_buf = ep.get_buf_mut();
-        if ep_buf.len() < buf.len() {
-            return Err(UsbError::BufferOverflow);
-        }
-        ep_buf[..buf.len()].copy_from_slice(buf);
-
-        buf_control.modify(|r, w| unsafe {
-            w.length_0().bits(buf.len() as u16);
-            w.full_0().set_bit();
-            w.pid_0().bit(!r.pid_0().bit())
-        });
-        crate::arch::delay(12);
-        buf_control.modify(|_, w| w.available_0().set_bit());
-
-        Ok(buf.len())
     }
 
     fn ep_read(&mut self, ep_addr: EndpointAddress, buf: &mut [u8]) -> UsbResult<usize> {
